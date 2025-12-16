@@ -14,4 +14,3 @@ hypy-utils
 tqdm
 safetensors
 scipy
-vllm

@@ -45,6 +45,7 @@ python grpo.py \
   --reward_mode toolrl_exact \
   --output_dir outputs/grpo_toolrl_exact \
   --filter_train \
+  --prompt_pool_size 4096 \
   --prompt_length_quantile 0.90 \
   --append_think_control no_think \
   --learning_rate 5e-6 \
@@ -61,6 +62,7 @@ python grpo.py \
   --reward_mode dx7_dist \
   --output_dir outputs/grpo_dx7_dist \
   --filter_train \
+  --prompt_pool_size 4096 \
   --prompt_length_quantile 0.90 \
   --append_think_control no_think \
   --learning_rate 5e-6 \

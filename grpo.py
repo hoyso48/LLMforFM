@@ -833,7 +833,14 @@ def main() -> None:
     parser.add_argument("--alltheweb_train_captions_csv", type=str, default="data/DX7_AllTheWeb_train_captions.csv")
     parser.add_argument("--no_alltheweb", action="store_true", help="Train only on Yamaha train split (skip AllTheWeb).")
     parser.add_argument("--filter_train", action="store_true", help="Filter out inaudible / NULL-name rows (recommended).")
-    parser.add_argument("--max_train_samples", type=int, default=4096, help="Max number of unique prompts for GRPO.")
+    parser.add_argument(
+        "--prompt_pool_size",
+        "--max_train_samples",
+        dest="max_train_samples",
+        type=int,
+        default=4096,
+        help="Number of prompts in the GRPO prompt pool (sampled from the train split). Alias: --max_train_samples.",
+    )
     parser.add_argument(
         "--prompt_length_quantile",
         type=float,
