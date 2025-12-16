@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import argparse
 import ast
-import hashlib
 import json
 import math
 import os
@@ -281,38 +280,82 @@ def _compute_token_lengths_by_group(
     print(_describe_lengths("NON-REASONING (no cot)", non_lens, top_frac=top_frac, max_seq_length=max_seq_length), end="")
 
 
-def _stable_u01(*, seed: int, sample_id: int) -> float:
+def _is_reasoning_cot(cot_text: Any) -> bool:
+    return isinstance(cot_text, str) and cot_text.strip() != ""
+
+
+def _build_assistant_target(*, cot_text: Any, patch_block: str) -> str:
     """
-    Deterministic U[0,1) pseudo-random number for (seed, sample_id).
-    Used to downsample/keep CoT in a reproducible way.
+    Always keep ALL reasoning data:
+    - If cot is non-empty: emit <think>cot</think> + final patch block.
+    - Else: emit only the final patch block (no explicit think content).
     """
-    msg = f"{seed}:{sample_id}".encode("utf-8")
-    h = hashlib.sha256(msg).digest()
-    x = int.from_bytes(h[:8], byteorder="big", signed=False)
-    return x / 2**64
-
-
-def _should_use_cot(*, cot_text: Any, sample_id: Any, seed: int, reasoning_prob: float) -> bool:
-    if not (0.0 <= float(reasoning_prob) <= 1.0):
-        raise ValueError(f"reasoning_prob must be in [0,1], got {reasoning_prob}")
-
-    if not _is_non_empty_str(cot_text):
-        return False
-
-    if reasoning_prob >= 1.0:
-        return True
-    if reasoning_prob <= 0.0:
-        return False
-
-    sid = int(sample_id)
-    return _stable_u01(seed=seed, sample_id=sid) < float(reasoning_prob)
-
-
-def _build_assistant_target(*, cot_text: Any, patch_block: str, sample_id: Any, seed: int, reasoning_prob: float) -> str:
-    if _should_use_cot(cot_text=cot_text, sample_id=sample_id, seed=seed, reasoning_prob=reasoning_prob):
+    if _is_reasoning_cot(cot_text):
         cot = str(cot_text).strip()
         return f"<think>\n{cot}\n</think>\n{patch_block}"
     return patch_block
+
+
+def _downsample_non_reasoning_for_target_ratio(
+    train_df: pd.DataFrame,
+    *,
+    reasoning_prob: float | None,
+    seed: int,
+) -> pd.DataFrame:
+    """
+    Interpret `reasoning_prob` as the desired fraction of reasoning examples in the FINAL training set:
+
+      p = (#reasoning) / (#reasoning + #non_reasoning_kept)
+
+    Constraints (as requested):
+    - All reasoning rows (cot non-empty) are ALWAYS kept.
+    - Only non-reasoning rows may be downsampled.
+    - If `reasoning_prob` is None: keep all data (natural ratio).
+    - You cannot request a ratio lower than the natural ratio, since we never drop reasoning rows.
+    """
+    if reasoning_prob is None:
+        return train_df
+
+    p = float(reasoning_prob)
+    if not (0.0 < p <= 1.0):
+        raise ValueError(f"--reasoning_prob must be in (0,1], got {reasoning_prob}")
+
+    if "cot" not in train_df.columns:
+        # No reasoning info available; nothing to downsample towards p.
+        return train_df
+
+    is_reasoning = train_df["cot"].apply(_is_reasoning_cot)
+    r_df = train_df[is_reasoning].copy()
+    n_df = train_df[~is_reasoning].copy()
+
+    r = int(len(r_df))
+    n = int(len(n_df))
+    total = r + n
+    if total == 0:
+        return train_df
+    if r == 0:
+        raise ValueError("No reasoning (non-empty cot) rows found, but --reasoning_prob was provided.")
+
+    natural = r / total
+    if p < natural:
+        raise ValueError(
+            f"Requested --reasoning_prob={p:.4f} is lower than the natural ratio {natural:.4f} "
+            f"(reasoning={r}, non_reasoning={n}). We never drop reasoning rows, so this is impossible."
+        )
+
+    # Desired non-reasoning count to achieve ratio p:
+    #   p = r / (r + n_keep)  =>  n_keep = r*(1-p)/p
+    if p >= 1.0:
+        n_keep = 0
+    else:
+        n_keep = int(math.floor(r * (1.0 - p) / p))
+
+    if n_keep >= n:
+        # Already at or above the requested ratio; keep all data.
+        return train_df
+
+    n_keep_df = n_df.sample(n=n_keep, random_state=int(seed)) if n_keep > 0 else n_df.head(0)
+    return pd.concat([r_df, n_keep_df], ignore_index=True)
 
 
 def _load_csv(path: Path, *, index_col: int = 0) -> pd.DataFrame:
@@ -345,8 +388,12 @@ def main() -> None:
     parser.add_argument(
         "--reasoning_prob",
         type=float,
-        default=1.0,
-        help="For rows that have non-empty `cot`, keep it with probability p (otherwise drop it). Default=1.0 (use all available).",
+        default=None,
+        help=(
+            "Target fraction of reasoning examples in the FINAL training set. "
+            "All reasoning rows (non-empty `cot`) are always kept; only non-reasoning rows are downsampled. "
+            "If omitted, uses ALL data (natural ratio)."
+        ),
     )
     parser.add_argument("--seed", type=int, default=3407)
 
@@ -373,7 +420,7 @@ def main() -> None:
 
     # Training (kept for parity; training call is commented out by default).
     parser.add_argument("--load_model", action="store_true", help="Load model + build Trainer (does NOT start training unless you uncomment).")
-    parser.add_argument("--model", type=str, default="Qwen3-8B")
+    parser.add_argument("--model", type=str, default="unsloth/Qwen3-8B")
     parser.add_argument("--model_path", type=str, default="models/Qwen3-8B-fp8-cot-mix")
     parser.add_argument("--precision", type=str, default="fp8", choices=["fp8", "bf16"])
     parser.add_argument("--responses_only", action="store_true")
@@ -438,6 +485,13 @@ def main() -> None:
         # Training can still proceed, but all examples will be non-reasoning.
         train_df["cot"] = None
 
+    # Apply dataset-level reasoning ratio (keeps ALL reasoning rows; downsamples non-reasoning only).
+    train_df = _downsample_non_reasoning_for_target_ratio(
+        train_df,
+        reasoning_prob=args.reasoning_prob,
+        seed=int(args.seed),
+    )
+
     prompt_template = zeroshot_schema_prompt if args.use_schema_prompt else zeroshot_prompt
 
     # Keep only what we need.
@@ -467,9 +521,6 @@ def main() -> None:
             assistant_text = _build_assistant_target(
                 cot_text=cot_text,
                 patch_block=patch_block,
-                sample_id=sample_id,
-                seed=int(args.seed),
-                reasoning_prob=float(args.reasoning_prob),
             )
 
             conversations.append(
@@ -497,21 +548,21 @@ def main() -> None:
         return
 
     # -------------------------------
-    # Optional: 75:25 reasoning mix
+    # Optional: target reasoning ratio
     # -------------------------------
-    # If you want to force a 75:25 mix (reasoning:non-reasoning) *for cot-available rows*,
-    # uncomment the following line and re-run:
+    # Example: to target ~75% reasoning examples overall (keep all reasoning; downsample non-reasoning):
     #
-    # args.reasoning_prob = 0.75
-    #
-    # This will deterministically drop the `cot` text for ~25% of rows that have `cot` filled.
+    #   python fine_tuning.py --reasoning_prob 0.75
 
     if args.print_examples or not args.load_model:
         # Basic stats for sanity.
-        cot_nonempty = int(train_df["cot"].apply(lambda x: isinstance(x, str) and x.strip() != "").sum())
-        print(f"Train rows: {len(train_df)} (cot non-empty: {cot_nonempty})")
+        cot_nonempty = int(train_df["cot"].apply(_is_reasoning_cot).sum())
+        total = int(len(train_df))
+        non = int(total - cot_nonempty)
+        frac = (cot_nonempty / total) if total else 0.0
+        print(f"Train rows: {total} (reasoning={cot_nonempty}, non_reasoning={non}, frac={frac:.4f})")
         print(f"Test rows:  {len(test_df)}")
-        print(f"reasoning_prob (cot-available): {args.reasoning_prob}")
+        print(f"reasoning_prob (target overall ratio): {args.reasoning_prob}")
 
         def _print_with_head_tail(label: str, *, user_text: str, assistant_text: str) -> None:
             """
