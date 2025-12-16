@@ -232,7 +232,13 @@ def _canonicalize_ground_truth(specs: dict[str, Any], *, row_id: Any, keys_to_re
     if missing:
         raise ValueError(f"Row {row_id}: ground-truth patch is missing required keys: {missing}")
     canonical = {k: stripped[k] for k in KEY_ORDER}
-    ok = bool(validate_specs(canonical, syx_file="", patch_number=-1, verbose=False))
+    # Validate shapes/types first so validate_specs() can't crash on malformed arrays.
+    if not _validate_discrete_dx7_schema(canonical):
+        raise ValueError(f"Row {row_id}: ground-truth patch failed discrete DX7 schema validation")
+    try:
+        ok = bool(validate_specs(canonical, syx_file="", patch_number=-1, verbose=False))
+    except (KeyError, TypeError, ValueError, IndexError):
+        ok = False
     if not ok:
         raise ValueError(f"Row {row_id}: ground-truth patch failed validate_specs()")
     return canonical
@@ -391,13 +397,13 @@ def _is_valid_dx7_patch(specs: dict[str, Any]) -> bool:
     if not _has_all_required_keys(specs):
         return False
     canonical = {k: specs[k] for k in KEY_ORDER}
+    # Guard first: validate_specs() is not shape-safe (it can IndexError on malformed modmatrix).
+    if not _validate_discrete_dx7_schema(canonical):
+        return False
     try:
-        ok = bool(validate_specs(canonical, syx_file="", patch_number=-1, verbose=False))
-    except (KeyError, TypeError, ValueError):
+        return bool(validate_specs(canonical, syx_file="", patch_number=-1, verbose=False))
+    except (KeyError, TypeError, ValueError, IndexError):
         return False
-    if not ok:
-        return False
-    return _validate_discrete_dx7_schema(canonical)
 
 
 def _jaccard(a: set[str], b: set[str]) -> float:
