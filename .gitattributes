@@ -1,0 +1,29 @@
+# Track datasets and large binary artifacts with Git LFS.
+# After cloning, run:
+#   git lfs install
+#   git lfs pull
+
+# Small/medium datasets shipped with this repo (requested: data/*.csv)
+data/*.csv filter=lfs diff=lfs merge=lfs -text
+
+# Common large ML artifacts (optional)
+*.pt filter=lfs diff=lfs merge=lfs -text
+*.pth filter=lfs diff=lfs merge=lfs -text
+*.bin filter=lfs diff=lfs merge=lfs -text
+*.ckpt filter=lfs diff=lfs merge=lfs -text
+*.safetensors filter=lfs diff=lfs merge=lfs -text
+*.onnx filter=lfs diff=lfs merge=lfs -text
+
+# Numpy arrays / embeddings
+*.npy filter=lfs diff=lfs merge=lfs -text
+*.npz filter=lfs diff=lfs merge=lfs -text
+
+# Audio
+*.wav filter=lfs diff=lfs merge=lfs -text
+*.flac filter=lfs diff=lfs merge=lfs -text
+*.mp3 filter=lfs diff=lfs merge=lfs -text
+*.ogg filter=lfs diff=lfs merge=lfs -text
+
+# Sysex patches
+*.syx filter=lfs diff=lfs merge=lfs -text
+
