@@ -11,3 +11,6 @@ tenacity
 google-genai
 audiobox_aesthetics
 hypy-utils
+tqdm
+safetensors
+scipy

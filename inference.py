@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from tqdm import tqdm
 
 # Allow running this script from anywhere (not only from the repo root).
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -182,6 +183,11 @@ def main() -> None:
     parser.add_argument("--device", type=str, default=None, help="Device string (e.g. cuda, cpu). Default: auto.")
 
     parser.add_argument("--enable_thinking", action="store_true", help="Pass enable_thinking=True to the tokenizer chat template.")
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="If set, stream generated text to stdout during generation (useful for debugging).",
+    )
     parser.add_argument("--max_new_tokens", type=int, default=1024)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top_p", type=float, default=0.95)
@@ -290,7 +296,11 @@ def main() -> None:
         _ensure_parent_dir(output_csv_path)
         pd.DataFrame(out_rows).to_csv(output_csv_path, index=False)
 
-    for i, row in df.iterrows():
+    # Keep tqdm on stderr so stdout can be used for piping/streaming.
+    pbar = tqdm(df.iterrows(), total=len(df), desc="Inference", dynamic_ncols=True, file=sys.stderr)
+    n_parse_ok = 0
+    n_valid_ok = 0
+    for _, row in pbar:
         sample_id = row.get(args.id_column)
         caption = row.get(args.caption_column)
 
@@ -338,8 +348,17 @@ def main() -> None:
         else:
             gen_kwargs["do_sample"] = False
 
+        streamer = None
+        if args.stream:
+            # Lazy import to keep non-streaming runs lightweight.
+            from transformers import TextStreamer
+
+            # Print only the generated continuation.
+            streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+            print(f"\n\n--- id={sample_id} ---\n", flush=True)
+
         with torch.no_grad():
-            output_ids = model.generate(**inputs, **gen_kwargs)
+            output_ids = model.generate(**inputs, **gen_kwargs, streamer=streamer)
 
         # Decode only the generated continuation (exclude prompt).
         gen_only = output_ids[0][input_len:]
@@ -416,6 +435,15 @@ def main() -> None:
                 "validation_error": validation_error,
                 "wav_path": rendered_wav_rel if args.render_wav else wav_path,
             }
+        )
+
+        if parse_ok:
+            n_parse_ok += 1
+        if validation_ok:
+            n_valid_ok += 1
+        pbar.set_postfix(
+            parse_ok=f"{n_parse_ok}/{len(out_rows)}",
+            valid_ok=f"{n_valid_ok}/{len(out_rows)}",
         )
 
         if args.print_every and int(args.print_every) > 0 and ((len(out_rows) % int(args.print_every)) == 0):
