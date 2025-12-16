@@ -116,23 +116,20 @@ Result: a dataset of **(caption, patch, audio)** triples.
 ### 5.3 Model & Training
 
 - **Backbone**: Qwen3-8B (open-weight instruction-tuned LLM).  
-- **Input**: the caption only (no extra formatting hints), to keep prompts short and avoid over-guiding the output structure.  
-- **Output**: full DX7 patch in Python-dict style, for example:
-
-    {
-      "modmatrix": [...],
-      "outmatrix": [...],
-      "env": [...],
-      "freq_ratios": [...],
-      "sensitivity": [...],
-      ...
-    }
-
-- **Objective**: next-token prediction (cross-entropy) on the patch tokens (supervised fine-tuning on caption → patch).  
+- **Input**: caption, optionally with an explicit *hybrid-thinking control token* appended:
+  - `/think` for “produce reasoning + answer”
+  - `/no_think` for “answer only”
+- **Output**: DX7 patch **JSON** in a canonical format, optionally preceded by a Qwen-style thinking block:
+  - reasoning examples: `<think> ... </think>` contains the intermediate reasoning trace
+  - non-reasoning examples: empty `<think>\n\n</think>` block
+  - the final patch is emitted as a **fenced JSON code block** (readable, one top-level key per line)
+- **Objective**: supervised fine-tuning (SFT; cross-entropy) on the assistant tokens (caption → `<think>` + patch JSON).  
 - **Training setup**:
   - Full fine-tuning for one epoch.  
   - FP8 precision on H100 GPU.  
-- **Reasoning**: current version uses direct mapping (caption → patch) without explicit chain-of-thought.
+- **Reasoning data**:
+  - A subset of training rows includes a `cot` column (teacher-generated pseudo reasoning).
+  - We keep **all** reasoning rows and optionally downsample non-reasoning rows to hit a target reasoning ratio.
 
 ---
 
@@ -258,7 +255,8 @@ Compared to AudioLDM and AudioGen, the fine-tuned LLM emphasizes **accurate reco
 
 
 ## IMPORTANT CHANGE
-- WE CHANGED EVERYHING RELATED PYTHON FORMATTING TO JSON(TO FOLLOW GENERAL TOOL CALLING SCHEMES)
+- WE CHANGED EVERYHING RELATED PYTHON FORMATTING TO JSON (to follow general tool-calling schemes).
+- Student SFT now uses **Qwen3 hybrid thinking control** (`/think` vs `/no_think`) and an explicit `<think>...</think>` block before the final patch JSON.
 
 
 
@@ -289,7 +287,7 @@ The **analysis** is allowed to be explicitly diagnostic (“FULL vs OP2_OFF lose
 
 ---
 
-#### Ablation semantics: “turning an operator off”
+#### Operator evidence semantics: OPk_OFF (ablation) vs OPk_ON (isolation)
 
 We treat the DX7 algorithm as a directed modulation graph over 6 operators (`modmatrix` + `outmatrix`).
 
@@ -313,6 +311,15 @@ Thus, the difference between:
 
 is attributable only to OPk (and its branch), which we use as the core evidence for non-hallucinated analysis.
 
+For an operator OP\_k, **isolation (“OPk\_ON”)** is an alternative evidence view:
+
+- keep **only OPk and its downstream closure** (following modulation edges OPj → OPi where `modmatrix[i][j]=1`),
+- preserve original connections and carriers **within** this kept subgraph,
+- disable everything else (no bypass/new edges),
+- if the kept subgraph has **no carriers** (silent), OPk\_ON may be omitted rather than forcing an artificial output route.
+
+In code, we support both variants via separate teacher prompts (`cot_generation_prompt` for OFF, `cot_generation_prompt_opk_on` for ON) and a shared renderer that can produce concatenated FULL + OPk segments plus a segment map.
+
 ---
 
 #### Data generation pipeline (teacher side w/ frontier ALM)
@@ -322,9 +329,12 @@ For each training example (prompt, DX7 patch JSON, audio):
 1. **Ground-truth patch and audio rendering**
    - Start from a natural language prompt describing the target sound.
    - Select or design a ground-truth DX7 patch in our unified JSON format.
-   - Render:
-     - `Audio_FULL` from the complete patch and a fixed MIDI input (pitch, velocity, duration),
-     - `Audio_OPk_OFF` for a subset of operators (typically all modulators and/or non-trivial branches) using the ablation semantics above.
+   - Render `Audio_FULL` from the complete patch and a fixed MIDI input (pitch, velocity, duration).
+   - Render operator evidence segments using **either**:
+     - `Audio_OPk_OFF` (ablation), or
+     - `Audio_OPk_ON` (isolation),
+     depending on which teacher prompt variant is used.
+   - Concatenate these segments into a single `Audio_COMBINED` clip and save a **segment map** (time spans) as metadata.
 
 2. **Single-shot ALM prompting**
    - Provide the frontier ALM with:
@@ -332,7 +342,10 @@ For each training example (prompt, DX7 patch JSON, audio):
      - the DX7 JSON schema (key descriptions),
      - the ground-truth patch JSON (`{DX7_SPECS_JSON}`),
      - `Audio_FULL`, and the list of available ablations `{OP_ABLATION_LIST}`.
-   - The prompt **explicitly specifies the required output structure**:
+   - Use one of the prompt templates in `prompt.py`:
+     - `cot_generation_prompt` (FULL + OPk_OFF), or
+     - `cot_generation_prompt_opk_on` (FULL + OPk_ON).
+   - The teacher prompt **explicitly specifies the required output structure**:
      1. **Analysis section** (outside `\cot{}`):  
         - Full-access analysis of `Audio_FULL` and `Audio_OPk_OFF`, plus the JSON.  
         - For each operator with ablation:
@@ -370,10 +383,10 @@ For each training example (prompt, DX7 patch JSON, audio):
      - and the **final JSON** (ground-truth patch).
    - The **analysis section is discarded** for student training; it is only used to enforce good behaviour in the teacher prompt.
    - Training pairs thus have the form:
-     - input: prompt (+ optional schema description),
-     - output: `\cot{...}` reasoning text + final DX7 patch JSON.
+     - input: caption (optionally ending with `/think` or `/no_think`),
+     - output: a Qwen-style `<think>...</think>` block (empty for `/no_think`) + final DX7 patch JSON.
 
-The student LLM is trained purely on text, without audio, to imitate the teacher’s pseudo reasoning format and to emit a complete patch JSON in one shot.
+The student LLM is trained purely on text (no audio) to produce a complete patch JSON in one shot, optionally with an explicit reasoning trace.
 
 ---
 
@@ -392,11 +405,66 @@ The student LLM is trained purely on text, without audio, to imitate the teacher
   - The `\cot{...}` block is explicitly framed as a **pseudo reasoning path**, which the student LLM is trained to emulate (not as ground-truth audio analysis).
 
 - **Inference-time compatibility**
-  - At inference, the student model receives **only text** (prompt + schema) and must output:
-    - a CoT-style reasoning trace in the same `\cot{...}` format, and
-    - a final DX7 patch JSON.
-  - No iterative edit–listen loops are required, and no audio feedback is assumed at inference.
+  - At inference, the student model receives **only text** and outputs a patch in one shot.
+  - Reasoning is explicitly controllable via `/think` vs `/no_think` (and/or Qwen3 “thinking” settings in generation APIs), without requiring any audio feedback at inference.
 
 - **Alignment with interpretable patch structure**
   - Roles like “adds metallic attack”, “thickens low mids”, “provides soft sustain body” are explicitly tied to operator indices and modulation topology.
   - This yields CoTs that are both semantically meaningful and directly actionable in terms of DX7 parameters.
+
+---
+
+### RL for tool learning (ToolRL-style GRPO) with a dense, weighted parameter-distance reward
+
+**Goal.**  
+Move beyond SFT’s brittle “all-or-nothing” supervision by optimizing the model directly for **DX7 tool-call quality** using RL, following ToolRL’s core finding that **reward design** (format + fine-grained correctness) is the primary driver for stable tool learning under GRPO.
+
+#### Setup
+
+- **Query \(Q\)**: caption text (optionally ending with `/think` or `/no_think`).
+- **Action \(a\)**: a single DX7 patch JSON object in our canonical schema (128 parameters).
+- **Rollouts**: sample \(K\) candidate patches per caption; compute rewards; update with **GRPO** (group-wise advantage normalization over the \(K\) samples).
+
+#### Reward design (ToolRL baseline + our distance-based extension)
+
+We keep a **ToolRL-faithful baseline** (for apples-to-apples comparison), then introduce one change that is tailored to DX7: replace exact-match value reward with a **continuous parameter-distance** score.
+
+- **Baseline: ToolRL-style exact-match correctness**  
+  ToolRL decomposes reward into \(R_\text{final}=R_\text{format}+R_\text{correct}\), where \(R_\text{format}\in\{0,1\}\) checks structure/format, and \(R_\text{correct}\) gives **fine-grained partial credit** by matching:
+  - tool name (trivial in our single-tool setting but kept for consistency),
+  - parameter names/keys,
+  - parameter values via **exact match** (indicator \(\mathbb{1}[x_k=x_k^*]\)).
+  This is our **baseline reward** for GRPO to ensure we are truly “following ToolRL”.
+
+- **Format / validity reward \(R_\text{format}\in\{0,1\}\)**  
+  1 iff the output parses as JSON and passes schema checks (required keys present, correct shapes, valid ranges). Otherwise 0.
+
+- **Key coverage reward \(R_\text{keys}\in[0,1]\)**  
+  Fraction of required keys that are present (and correctly typed). This gives partial credit when the model produces an almost-complete patch.
+
+- **Extension (ours): weighted parameter-distance reward \(R_\text{dist}\in[0,1]\)** *(main signal)*  
+  For each parameter \(k\) with ground-truth value \(x_k^*\) and prediction \(x_k\):
+  - **bounded numeric**: \(s_k=\mathrm{clip}(1-|x_k-x_k^*|/(u_k-l_k),0,1)\)
+  - **categorical / boolean**: \(s_k=\mathbb{1}[x_k=x_k^*]\)
+  - **vectors / matrices** (e.g., `outmatrix`, `modmatrix`, envelopes): average element-wise \(s_k\)
+
+  Aggregate with per-key weights \(w_k\):
+  \[
+  R_\text{dist}=\frac{\sum_k w_k\,s_k}{\sum_k w_k}
+  \]
+
+- **Final reward**  
+  **We do NOT use annealing.** Since we initialize GRPO from our SFT checkpoint (JSON format already stable), we use **constant** weights:
+  \(R=\alpha\,R_\text{format}+\beta\,R_\text{keys}+\gamma\,R_\text{dist}\).  
+  Format stability is enforced by keeping \(R_\text{format}\) as a hard validity gate (invalid JSON / schema violations receive 0 format reward and are heavily disfavored by the total reward).
+
+#### Per-key weighting (one simple bet)
+
+We prioritize keys that most strongly change timbre/structure, using a small number of weight groups:
+
+- **Topology (highest weight)**: `modmatrix`, `outmatrix`, `feedback`, `fixed_freq`
+- **Operator amplitude + envelopes (high)**: `ol`, operator envelope rates/levels
+- **Frequency ratios (medium)**: `coarse`, `fine`, `detune`
+- **Global / misc (low–medium)**: feedback, LFO, transpose, sensitivities, etc.
+
+This is intentionally the **single idea to push**: a dense, difference-based reward avoids the zero-reward cliff when one integer is off-by-1, provides better credit assignment than exact-match, and is cheap enough to run GRPO at scale. Once the policy reliably emits valid patches, we can optionally add **tool-execution** reward terms (e.g., CLAP\_synth between rendered audio clips) as a small bonus rather than the main signal.

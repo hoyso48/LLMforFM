@@ -61,7 +61,7 @@ cot_generation_prompt = r"""You are an Audio-Language Model (ALM) and an expert 
 Your job is to produce, in a SINGLE response, (1) an analysis section, (2) a pseudo Chain-of-Thought (CoT) reasoning trace, and (3) the final DX7 patch JSON.
 
 - The analysis section may use full knowledge of the ground-truth patch and all audio.
-- The CoT section must simulate how a student model would reason from the prompt and audio (as if it does NOT already know the ground-truth answer).
+- The CoT section must simulate how a student model would reason from PROMPT only (text-only; no audio at inference).
 - The final JSON must exactly match the given DX7 patch values (keys and values must be identical) and must be valid JSON (no comments).
 
 This data will be used to train a text-only model that designs DX7 patches in one shot (no iterative edits, no audio at inference).
@@ -220,20 +220,19 @@ Think of it as your own internal verification that the patch and ablations are c
 2. CoT block (\cot{{...}})
 ----------------------
 
-Inside the \cot{{...}} block, you must generate a **pseudo Chain-of-Thought** that simulates how a student model would reason to arrive at the correct patch from the prompt and audio:
+Inside the \cot{{...}} block, you must generate a **pseudo Chain-of-Thought** that simulates how a student model would reason to arrive at the correct patch from PROMPT only (text-only; no audio at inference):
 
 - You should **pretend that you do not already know** the ground-truth JSON as the answer.
 - You may still refer to:
   - PROMPT,
   - the general DX7 format (what parameters exist, what operators are),
-  - Audio_FULL,
-  - and the ablated segments in Audio_COMBINED as if you are using them to guide your design.
+  - general FM sound-design heuristics (carrier/modulator roles, ratios, envelopes, feedback, modulation depth).
 - The CoT should show a plausible reasoning path such as:
   - interpreting the prompt (e.g., “I need a bright percussive electric piano tone”),
   - deciding how many carriers are needed and why,
   - deciding which operators should be modulators and what ratios they likely use,
-  - using imagined experiments like “if I disable one operator, the attack becomes duller, so that operator should act as a high-ratio modulator for attack brightness”,
-  - refining envelopes and sensitivity based on perceived attack/decay and dynamics.
+  - choosing envelopes and sensitivity to match the described attack/decay/sustain/release,
+  - refining levels and modulation depth to match the described timbre (bright/dull, metallic/soft, etc.).
 
 Important constraints for the CoT block:
 
@@ -244,10 +243,10 @@ Important constraints for the CoT block:
   }}
 
 - Do NOT explicitly mention that you already know the ground-truth patch or that you are simulating.
-  Instead, write as if you are actually solving the design problem using the prompt and the ablated audio segments.
-- Do NOT reference segment labels or the segment map (e.g., OP2_OFF / OP3_ON / SEGMENT_MAP) inside \cot{{...}}.
-  If you describe an imagined test, phrase it generically (e.g., “if I disable one modulator…”, “if I isolate a carrier branch…”).
-- If a difference between FULL and OPk_OFF is subtle, you may say so in the CoT (e.g., “The change is small, so OP3 probably plays a minor supportive role.”), but keep it in the style of someone exploring the solution.
+  Instead, write as if you are actually solving the design problem using PROMPT only.
+- Do NOT reference any audio inputs or audio-derived evidence inside \cot{{...}} (Audio_FULL, Audio_COMBINED, OPk_OFF/OPk_ON segments, or SEGMENT_MAP).
+  If you describe an imagined test, phrase it generically and purely text-based (e.g., “to increase brightness, I can raise a modulator ratio or modulation depth…”).
+- If you are unsure about an operator's role, you may say it plays a minor supportive role, but keep it in the style of someone exploring the solution.
 - Do NOT output the full JSON inside \cot{{...}}. You may refer to specific fields (e.g., "coarse[0] = 1", "outmatrix[2] = 1") in text form, but the structured JSON object must not appear there.
 - The CoT should be reasonably detailed and multi-step, not a 1–2 sentence summary. We want diverse, rich reasoning traces that are aligned with your internal reasoning style.
 
@@ -276,7 +275,7 @@ SUMMARY
 ======================================================================
 
 - Analysis section: honest, full-knowledge analysis of FULL and ablated segments vs the patch JSON.
-- CoT section (\cot{{...}}): pseudo reasoning path, as if discovering the patch using the prompt and ablated audio segments, without admitting that the answer is known.
+- CoT section (\cot{{...}}): pseudo reasoning path, as if discovering the patch from PROMPT only (no audio/segment references), without admitting that the answer is known.
 - Final JSON: exact ground-truth DX7 patch, with identical key–value content to PATCH_JSON.
 """
 
@@ -288,7 +287,7 @@ cot_generation_prompt_opk_on = r"""You are an Audio-Language Model (ALM) and an 
 Your job is to produce, in a SINGLE response, (1) an analysis section, (2) a pseudo Chain-of-Thought (CoT) reasoning trace, and (3) the final DX7 patch JSON.
 
 - The analysis section may use full knowledge of the ground-truth patch and all audio.
-- The CoT section must simulate how a student model would reason from the prompt and audio (as if it does NOT already know the ground-truth answer).
+- The CoT section must simulate how a student model would reason from PROMPT only (text-only; no audio at inference).
 - The final JSON must exactly match the given DX7 patch values (keys and values must be identical) and must be valid JSON (no comments).
 
 This data will be used to train a text-only model that designs DX7 patches in one shot (no iterative edits, no audio at inference).
@@ -458,18 +457,17 @@ Think of it as your own internal verification that the patch and isolation seman
 2. CoT block (\cot{{...}})
 ----------------------
 
-Inside the \cot{{...}} block, you must generate a **pseudo Chain-of-Thought** that simulates how a student model would reason to arrive at the correct patch from the prompt and audio:
+Inside the \cot{{...}} block, you must generate a **pseudo Chain-of-Thought** that simulates how a student model would reason to arrive at the correct patch from PROMPT only (text-only; no audio at inference):
 
 - You should **pretend that you do not already know** the ground-truth JSON as the answer.
 - You may still refer to:
   - PROMPT,
   - the general DX7 format (what parameters exist, what operators are),
-  - Audio_FULL,
-  - and the OPk_ON segments in Audio_COMBINED as if you are using them to guide your design.
+  - general FM sound-design heuristics (carrier/modulator roles, ratios, envelopes, feedback, modulation depth).
 - The CoT should show a plausible reasoning path such as:
   - interpreting the prompt,
-  - deciding which operator branches are likely responsible for which audible components,
-  - using imagined experiments like “isolating one operator branch preserves the main body, so that branch is likely a carrier with modulators feeding it.”
+  - deciding which operator branches are likely needed for the described timbre and envelope,
+  - using FM synthesis principles to justify carrier/modulator roles and parameter tendencies (ratios, envelopes, levels).
 
 Important constraints for the CoT block:
 
@@ -480,8 +478,8 @@ Important constraints for the CoT block:
   }}
 
 - Do NOT explicitly mention that you already know the ground-truth patch or that you are simulating.
-- Do NOT reference segment labels or the segment map (e.g., OP2_OFF / OP3_ON / SEGMENT_MAP) inside \cot{{...}}.
-  If you describe an imagined test, phrase it generically (e.g., “if I isolate a branch…”, “if I disable one operator…”).
+- Do NOT reference any audio inputs or audio-derived evidence inside \cot{{...}} (Audio_FULL, Audio_COMBINED, OPk_OFF/OPk_ON segments, or SEGMENT_MAP).
+  If you describe an imagined test, phrase it generically and purely text-based (e.g., “to get a bell-like tone, I can use higher modulator ratios and a fast decay…”).
 - Do NOT output the full JSON inside \cot{{...}}. You may refer to specific fields (e.g., "coarse[0] = 1", "outmatrix[2] = 1") in text form, but the structured JSON object must not appear there.
 - The CoT should be reasonably detailed and multi-step, not a 1–2 sentence summary.
 
@@ -510,6 +508,6 @@ SUMMARY
 ======================================================================
 
 - Analysis section: honest, full-knowledge analysis of FULL and OPk_ON segments vs the patch JSON.
-- CoT section (\cot{{...}}): pseudo reasoning path, as if discovering the patch using the prompt and OPk_ON segments, without admitting that the answer is known.
+- CoT section (\cot{{...}}): pseudo reasoning path, as if discovering the patch from PROMPT only (no audio/segment references), without admitting that the answer is known.
 - Final JSON: exact ground-truth DX7 patch, with identical key–value content to PATCH_JSON.
 """
