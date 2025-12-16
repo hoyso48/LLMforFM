@@ -383,6 +383,16 @@ def main() -> None:
         default='["name","has_fixed_freq"]',
         help="JSON list of patch keys to drop from patch_data before serializing to the final JSON.",
     )
+    parser.add_argument(
+        "--append_think_tags",
+        action="store_true",
+        help=(
+            "Append a Qwen3-style soft switch tag to the *caption* inside the user prompt: "
+            "rows with non-empty `cot` get '/think', rows without get '/no_think'. "
+            "This provides an explicit controllable token you can mirror at inference time. "
+            "Note: this is independent of the tokenizer template's enable_thinking flag."
+        ),
+    )
 
     # Reasoning mixing.
     parser.add_argument(
@@ -511,7 +521,11 @@ def main() -> None:
             if not _is_non_empty_str(caption):
                 raise ValueError(f"Row {sample_id}: missing caption")
 
-            user_text = prompt_template.format(prompt=str(caption))
+            caption_for_prompt = str(caption)
+            if args.append_think_tags:
+                caption_for_prompt = caption_for_prompt.rstrip() + (" /think" if _is_reasoning_cot(cot_text) else " /no_think")
+
+            user_text = prompt_template.format(prompt=caption_for_prompt)
             specs_raw = _parse_patch_data(patch_data, row_id=sample_id)
             specs = _canonicalize_specs(specs_raw, row_id=sample_id, keys_to_remove=keys_to_remove)
 

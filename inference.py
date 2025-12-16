@@ -76,7 +76,7 @@ def _canonicalize_specs(specs: dict, *, row_id: Any, keys_to_remove: list[str]) 
     return {k: specs[k] for k in KEY_ORDER}
 
 
-def _extract_think_text(text: str) -> str | None:
+def _extract_think_text_from_string(text: str) -> str | None:
     """
     Extract the first <think>...</think> block from a model response, if present.
     """
@@ -91,6 +91,75 @@ def _extract_think_text(text: str) -> str | None:
     inner = text[start + len("<think>") : end]
     inner = inner.strip("\n").strip()
     return inner
+
+
+def _get_single_token_id(tokenizer: Any, token: str) -> int | None:
+    """
+    Best-effort helper to get the token id for a single special token like </think>.
+    Returns None if it cannot be resolved to exactly one id.
+    """
+    try:
+        tid = tokenizer.convert_tokens_to_ids(token)
+        if isinstance(tid, int):
+            unk = getattr(tokenizer, "unk_token_id", None)
+            if unk is None or tid != unk:
+                return tid
+    except Exception:
+        pass
+
+    try:
+        ids = tokenizer.encode(token, add_special_tokens=False)
+        if isinstance(ids, list) and len(ids) == 1 and isinstance(ids[0], int):
+            return ids[0]
+    except Exception:
+        pass
+
+    return None
+
+
+def _split_qwen3_thinking(tokenizer: Any, gen_token_ids: list[int]) -> tuple[str | None, str, bool]:
+    """
+    Split a generated completion into:
+    - thinking content (inside the <think>...</think> block),
+    - final content (after </think>),
+    using the official Qwen3 approach: locate the </think> token id and split on it.
+
+    Important:
+    - Qwen3 uses special tokens for <think> / </think>, so decoding with
+      skip_special_tokens=True will typically *hide* the literal tags.
+    - This function returns decoded strings without special tokens, matching Qwen3 docs.
+    """
+    if not gen_token_ids:
+        return None, "", False
+
+    end_think_id = _get_single_token_id(tokenizer, "</think>")
+    if end_think_id is None:
+        # Fallback: the official Qwen3 docs use 151668 for </think>.
+        # If the tokenizer cannot resolve it, try the known id to avoid "no thinking" false alarms.
+        end_think_id = 151668
+
+    try:
+        # index points to the position *after* the last </think> token.
+        index = len(gen_token_ids) - gen_token_ids[::-1].index(int(end_think_id))
+    except ValueError:
+        # No </think> token present; treat everything as final content.
+        final_text = tokenizer.decode(gen_token_ids, skip_special_tokens=True).strip("\n")
+        # As a secondary fallback, try literal <think> tags if they survived decoding.
+        think_from_str = _extract_think_text_from_string(final_text)
+        if think_from_str is not None:
+            return think_from_str, final_text, True
+        return None, final_text, False
+
+    think_ids = gen_token_ids[:index]
+    final_ids = gen_token_ids[index:]
+    think_text = tokenizer.decode(think_ids, skip_special_tokens=True).strip("\n")
+    final_text = tokenizer.decode(final_ids, skip_special_tokens=True).strip("\n")
+
+    # If tags survived as plain text (e.g., due to manual training injection), strip them.
+    think_text = think_text.replace("<think>", "").replace("</think>", "").strip()
+    final_text = final_text.replace("<think>", "").replace("</think>", "").strip()
+
+    return think_text, final_text, True
 
 
 def _load_inputs(
@@ -173,6 +242,18 @@ def main() -> None:
         type=str,
         default='["name","has_fixed_freq"]',
         help="JSON list of patch keys to drop from the extracted patch before validating/rendering.",
+    )
+    parser.add_argument(
+        "--think_tag",
+        type=str,
+        default="none",
+        choices=["none", "auto", "think", "no_think"],
+        help=(
+            "Optionally append a Qwen3 soft-switch tag to the *caption* before formatting the prompt. "
+            "'think' appends '/think', 'no_think' appends '/no_think'. "
+            "'auto' appends '/think' only when --enable_thinking is set. "
+            "Note: Qwen3 soft-switch tags are only guaranteed to affect behavior when enable_thinking=True."
+        ),
     )
 
     # Model / generation
@@ -312,6 +393,8 @@ def main() -> None:
                     "prompt": None,
                     "response_text": None,
                     "think_text": None,
+                    "final_text": None,
+                    "think_found": False,
                     "patch_data": None,
                     "parse_ok": False,
                     "parse_error": "missing caption",
@@ -321,7 +404,19 @@ def main() -> None:
             )
             continue
 
-        user_text = prompt_template.format(prompt=str(caption))
+        caption_for_prompt = str(caption)
+        suffix = None
+        if args.think_tag == "think":
+            suffix = "/think"
+        elif args.think_tag == "no_think":
+            suffix = "/no_think"
+        elif args.think_tag == "auto" and bool(args.enable_thinking):
+            suffix = "/think"
+
+        if suffix is not None:
+            caption_for_prompt = caption_for_prompt.rstrip() + " " + suffix
+
+        user_text = prompt_template.format(prompt=caption_for_prompt)
         messages = [{"role": "user", "content": user_text}]
         text = tokenizer.apply_chat_template(
             messages,
@@ -362,9 +457,9 @@ def main() -> None:
 
         # Decode only the generated continuation (exclude prompt).
         gen_only = output_ids[0][input_len:]
-        response_text = tokenizer.decode(gen_only, skip_special_tokens=True)
-
-        think_text = _extract_think_text(response_text)
+        gen_only_ids = gen_only.tolist()
+        response_text = tokenizer.decode(gen_only_ids, skip_special_tokens=True)
+        think_text, final_text, think_found = _split_qwen3_thinking(tokenizer, gen_only_ids)
 
         parse_ok = False
         parse_error = None
@@ -374,7 +469,9 @@ def main() -> None:
         wav_path = row.get("wav_path") if "wav_path" in row else None
 
         try:
-            raw_specs = parse_last_specs(response_text)
+            # Prefer parsing from the post-thinking content if available.
+            parse_text = final_text if _is_non_empty_str(final_text) else response_text
+            raw_specs = parse_last_specs(parse_text)
             cleaned_specs = _canonicalize_specs(raw_specs, row_id=sample_id, keys_to_remove=keys_to_remove)
             patch_data_json = _json_compact(cleaned_specs)
             parse_ok = True
@@ -426,8 +523,11 @@ def main() -> None:
                 "top_k": int(args.top_k),
                 "do_sample": bool(args.do_sample),
                 "max_new_tokens": int(args.max_new_tokens),
+                "think_tag": str(args.think_tag),
                 "response_text": response_text,
                 "think_text": think_text,
+                "final_text": final_text,
+                "think_found": bool(think_found),
                 "patch_data": patch_data_json,
                 "parse_ok": bool(parse_ok),
                 "parse_error": parse_error,
