@@ -532,8 +532,14 @@ def main() -> None:
 
         return {"conversations": conversations}
 
-    train_conv = train_dataset.map(preprocess, batched=True)["conversations"]
-    test_conv = test_dataset.map(preprocess, batched=True)["conversations"]
+    # NOTE:
+    # `datasets.Dataset.__getitem__` returns a `datasets.arrow_dataset.Column`, which is list-like but
+    # NOT a real Python `list`. Some Transformers versions fail to detect "batched conversations"
+    # for non-list sequences and will interpret the outer list as a single conversation, causing:
+    #   jinja2.exceptions.UndefinedError: 'list object' has no attribute 'content'
+    # To make `tokenizer.apply_chat_template` reliably batch-render, force a concrete `list`.
+    train_conv = list(train_dataset.map(preprocess, batched=True)["conversations"])
+    test_conv = list(test_dataset.map(preprocess, batched=True)["conversations"])
 
     if args.analyze_lengths:
         if args.length_batch_size <= 0:

@@ -29,56 +29,83 @@ def serialize_specs(specs: dict) -> str:
 
     return json.dumps(specs, default=_json_default, indent=2)
 
-def validate_specs(specs, syx_file='', patch_number=-1):
+def validate_specs(specs, syx_file: str = "", patch_number: int = -1, *, verbose: bool = True) -> bool:
+    """
+    Validate a DX7 patch `specs` dict.
+
+    Notes:
+    - This function checks value ranges and array shapes for the fields used by this repo's
+      DX7 renderer.
+    - Warnings can be printed by setting `verbose=True` (default); otherwise the function
+      is silent and returns a boolean.
+    """
     valid = True
-    #it's ok if name is not present or empty
-    if 'name' not in specs:
-        # print(f"[WARNING] {syx_file}: patch {patch_number}: 'name' is not present.")
-        patch_name = 'NaN'
-    elif specs['name'] == '':
-        # print(f"[WARNING] {syx_file}: patch {patch_number}: 'name' is empty.")
-        patch_name = 'NaN'
+
+    # It's ok if 'name' is not present or empty.
+    if "name" not in specs:
+        patch_name = "NaN"
+    elif specs["name"] == "":
+        patch_name = "NaN"
     else:
-        patch_name = specs['name']
-    
+        patch_name = specs["name"]
+
     if not isinstance(patch_name, str):
-        print(f"[WARNING] {syx_file}: patch {patch_number} {patch_name}: 'name' is not a string.")
-        patch_name = 'NaN'
+        if verbose:
+            print(f"[WARNING] {syx_file}: patch {patch_number} {patch_name}: 'name' is not a string.")
+        patch_name = "NaN"
+
+    def _warn(msg: str) -> None:
+        if verbose:
+            print(msg)
 
     def check_range(name, value, lo, hi):
+        nonlocal valid
         if not lo <= value <= hi:
-            print(f"[WARNING] {syx_file}: patch {patch_number} {patch_name}: '{name}' = {value} is out of range [{lo}, {hi}]")
+            _warn(
+                f"[WARNING] {syx_file}: patch {patch_number} {patch_name}: '{name}' = {value} is out of range [{lo}, {hi}]"
+            )
             valid = False
 
     def check_list_range(name, lst, lo, hi):
+        nonlocal valid
         for idx, v in enumerate(lst):
             if not lo <= v <= hi:
-                print(f"[WARNING] {syx_file}: patch {patch_number} {patch_name}: '{name}[{idx}]' = {v} is out of range [{lo}, {hi}]")
+                _warn(
+                    f"[WARNING] {syx_file}: patch {patch_number} {patch_name}: '{name}[{idx}]' = {v} is out of range [{lo}, {hi}]"
+                )
                 valid = False
 
     def check_matrix_range(name, matrix, lo, hi):
+        nonlocal valid
         for i, row in enumerate(matrix):
             for j, v in enumerate(row):
                 if not lo <= v <= hi:
-                    print(f"[WARNING] {syx_file}: patch {patch_number} {patch_name}: '{name}[{i}][{j}]' = {v} is out of range [{lo}, {hi}]")
+                    _warn(
+                        f"[WARNING] {syx_file}: patch {patch_number} {patch_name}: '{name}[{i}][{j}]' = {v} is out of range [{lo}, {hi}]"
+                    )
                     valid = False
 
     def check_list_shape(name, lst, shape):
+        nonlocal valid
         if len(lst) != shape[0]:
-            print(f"[WARNING] {syx_file}: patch {patch_number} {patch_name}: '{name}' has incorrect shape. Expected {shape}, got {len(lst)}")
+            _warn(
+                f"[WARNING] {syx_file}: patch {patch_number} {patch_name}: '{name}' has incorrect shape. Expected {shape}, got {len(lst)}"
+            )
             valid = False
         if len(shape) == 2:
             for sub_list in lst:
                 if len(sub_list) != shape[1]:
-                    print(f"[WARNING] {syx_file}: patch {patch_number} {patch_name}: '{name}' has incorrect shape. Expected {shape}, got {len(sub_list)}")
+                    _warn(
+                        f"[WARNING] {syx_file}: patch {patch_number} {patch_name}: '{name}' has incorrect shape. Expected {shape}, got {len(sub_list)}"
+                    )
                     valid = False
     
     # Validate all fields
     check_matrix_range("modmatrix", specs['modmatrix'], 0, 1)
 
-    feedback_count = sum([specs['modmatrix'][i][i] for i in range(6)])
+    feedback_count = sum([specs["modmatrix"][i][i] for i in range(6)])
     if feedback_count > 1:
-        print(f"[WARNING] {syx_file}: patch {patch_number} {patch_name}: multiple operators have feedback.")
+        _warn(f"[WARNING] {syx_file}: patch {patch_number} {patch_name}: multiple operators have feedback.")
         valid = False
 
     check_list_range("outmatrix", specs['outmatrix'], 0, 1)
@@ -105,11 +132,11 @@ def validate_specs(specs, syx_file='', patch_number=-1):
     check_list_range("sensitivity", specs['sensitivity'], 0, 7)
 
     #it's ok if has_fixed_freqs is not present
-    if 'has_fixed_freqs' not in specs:
+    if "has_fixed_freqs" not in specs:
         # print(f"[WARNING] {syx_file}: patch {patch_number} {patch_name}: 'has_fixed_freqs' is not present.")
         pass
-    elif not isinstance(specs['has_fixed_freqs'], bool):
-        print(f"[WARNING] {syx_file}: patch {patch_number} {patch_name}: 'has_fixed_freqs' is not a boolean.")
+    elif not isinstance(specs["has_fixed_freqs"], bool):
+        _warn(f"[WARNING] {syx_file}: patch {patch_number} {patch_name}: 'has_fixed_freqs' is not a boolean.")
         valid = False
 
     return valid
