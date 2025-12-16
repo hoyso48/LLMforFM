@@ -686,8 +686,8 @@ def main() -> None:
     # -------------------------------
     # Training start (intentionally commented out)
     # -------------------------------
-    # trainer.train()
-    # trainer.save_model(args.model_path)
+    trainer.train()
+    trainer.save_model(args.model_path)
 
 
 if __name__ == "__main__":
