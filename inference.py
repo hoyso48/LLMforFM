@@ -217,6 +217,101 @@ def _sanitize_filename(name: str, *, max_len: int = 80) -> str:
     return safe[:max_len]
 
 
+def _default_render_specs() -> dict:
+    """
+    A safe DX7 patch used to repair/fallback rendering.
+    We keep it minimal and compatible with dx7_synth() requirements.
+    """
+    from dx7.pydx7 import get_modmatrix, get_outmatrix, DEFAULT_SPEC_PARAMS
+
+    alg = int(DEFAULT_SPEC_PARAMS.get("algorithm", 31))
+    return {
+        "modmatrix": get_modmatrix(alg).tolist(),
+        "outmatrix": get_outmatrix(alg).tolist(),
+        "feedback": int(DEFAULT_SPEC_PARAMS.get("feedback", 0)),
+        "fixed_freq": list(DEFAULT_SPEC_PARAMS.get("fixed_freq", [0] * 6)),
+        "coarse": list(DEFAULT_SPEC_PARAMS.get("coarse", [1] * 6)),
+        "fine": list(DEFAULT_SPEC_PARAMS.get("fine", [0] * 6)),
+        "detune": list(DEFAULT_SPEC_PARAMS.get("detune", [0] * 6)),
+        "transpose": int(DEFAULT_SPEC_PARAMS.get("transpose", 0)),
+        "ol": list(DEFAULT_SPEC_PARAMS.get("ol", [99, 0, 0, 0, 0, 0])),
+        "eg_rate": [list(r) for r in DEFAULT_SPEC_PARAMS.get("eg_rate", [[95] * 6] * 4)],
+        "eg_level": [list(r) for r in DEFAULT_SPEC_PARAMS.get("eg_level", [[99] * 6] * 3 + [[0] * 6])],
+        "sensitivity": list(DEFAULT_SPEC_PARAMS.get("sensitivity", [0] * 6)),
+    }
+
+
+def _repair_specs_for_render(specs: dict) -> tuple[dict, list[str]]:
+    """
+    Best-effort repair so the DX7 renderer doesn't crash.
+    - Truncate/pad 1D arrays to length 6
+    - Truncate/pad 2D EG arrays to shape (4,6)
+    - Ensure modmatrix is (6,6) and outmatrix is (6,)
+    Returns (repaired_specs, notes).
+    """
+    defaults = _default_render_specs()
+    notes: list[str] = []
+
+    def fix_list(name: str, value: Any, *, n: int, default: list, clamp01: bool = False) -> list:
+        if not isinstance(value, list):
+            notes.append(f"{name}: non-list -> default")
+            return list(default)
+        out = list(value[:n])
+        if len(out) < n:
+            out.extend(list(default[len(out) : n]))
+            notes.append(f"{name}: padded {len(value)}->{n}")
+        elif len(value) > n:
+            notes.append(f"{name}: truncated {len(value)}->{n}")
+        if clamp01:
+            out = [0 if int(v) <= 0 else 1 for v in out]
+        return out
+
+    def fix_matrix(name: str, value: Any, *, rows: int, cols: int, default: list[list]) -> list[list]:
+        if not isinstance(value, list) or not value or not all(isinstance(r, list) for r in value):
+            notes.append(f"{name}: non-2d-list -> default")
+            return [list(r) for r in default]
+        out_rows: list[list] = []
+        for r in range(rows):
+            if r < len(value) and isinstance(value[r], list):
+                row = list(value[r][:cols])
+                if len(row) < cols:
+                    row.extend(list(default[r][len(row) : cols]))
+                out_rows.append(row)
+            else:
+                out_rows.append(list(default[r]))
+        if len(value) != rows or any((r < len(value) and isinstance(value[r], list) and len(value[r]) != cols) for r in range(min(len(value), rows))):
+            notes.append(f"{name}: reshaped to ({rows},{cols})")
+        return out_rows
+
+    repaired = dict(specs) if isinstance(specs, dict) else {}
+
+    repaired["modmatrix"] = fix_matrix("modmatrix", repaired.get("modmatrix"), rows=6, cols=6, default=defaults["modmatrix"])
+    repaired["outmatrix"] = fix_list("outmatrix", repaired.get("outmatrix"), n=6, default=defaults["outmatrix"], clamp01=True)
+    repaired["fixed_freq"] = fix_list("fixed_freq", repaired.get("fixed_freq"), n=6, default=defaults["fixed_freq"], clamp01=True)
+    repaired["coarse"] = fix_list("coarse", repaired.get("coarse"), n=6, default=defaults["coarse"])
+    repaired["fine"] = fix_list("fine", repaired.get("fine"), n=6, default=defaults["fine"])
+    repaired["detune"] = fix_list("detune", repaired.get("detune"), n=6, default=defaults["detune"])
+    repaired["ol"] = fix_list("ol", repaired.get("ol"), n=6, default=defaults["ol"])
+    repaired["sensitivity"] = fix_list("sensitivity", repaired.get("sensitivity"), n=6, default=defaults["sensitivity"])
+    repaired["eg_rate"] = fix_matrix("eg_rate", repaired.get("eg_rate"), rows=4, cols=6, default=defaults["eg_rate"])
+    repaired["eg_level"] = fix_matrix("eg_level", repaired.get("eg_level"), rows=4, cols=6, default=defaults["eg_level"])
+
+    # Scalars
+    try:
+        repaired["feedback"] = int(repaired.get("feedback", defaults["feedback"]))
+    except Exception:
+        notes.append("feedback: non-int -> default")
+        repaired["feedback"] = int(defaults["feedback"])
+
+    try:
+        repaired["transpose"] = int(repaired.get("transpose", defaults["transpose"]))
+    except Exception:
+        notes.append("transpose: non-int -> default")
+        repaired["transpose"] = int(defaults["transpose"])
+
+    return repaired, notes
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate DX7 patches from captions with a fine-tuned Qwen3 model.")
 
@@ -246,13 +341,13 @@ def main() -> None:
     parser.add_argument(
         "--think_tag",
         type=str,
-        default="none",
+        default="auto",
         choices=["none", "auto", "think", "no_think"],
         help=(
             "Optionally append a Qwen3 soft-switch tag to the *caption* before formatting the prompt. "
             "'think' appends '/think', 'no_think' appends '/no_think'. "
-            "'auto' appends '/think' only when --enable_thinking is set. "
-            "Note: Qwen3 soft-switch tags are only guaranteed to affect behavior when enable_thinking=True."
+            "'auto' appends '/think' when --enable_thinking is set, else appends '/no_think'. "
+            "This matches the intended hybrid-thinking control behavior described in Qwen3 docs/blogs."
         ),
     )
 
@@ -287,6 +382,11 @@ def main() -> None:
     parser.add_argument("--n", type=int, default=60)
     parser.add_argument("--v", type=int, default=100)
     parser.add_argument("--out_scale", type=float, default=1.0)
+    parser.add_argument(
+        "--render_fallback_default",
+        action="store_true",
+        help="If rendering the predicted patch fails, render a default patch instead (still records render_error).",
+    )
 
     args = parser.parse_args()
 
@@ -410,8 +510,8 @@ def main() -> None:
             suffix = "/think"
         elif args.think_tag == "no_think":
             suffix = "/no_think"
-        elif args.think_tag == "auto" and bool(args.enable_thinking):
-            suffix = "/think"
+        elif args.think_tag == "auto":
+            suffix = "/think" if bool(args.enable_thinking) else "/no_think"
 
         if suffix is not None:
             caption_for_prompt = caption_for_prompt.rstrip() + " " + suffix
@@ -488,7 +588,12 @@ def main() -> None:
 
         # Optional audio rendering
         rendered_wav_rel = None
-        if args.render_wav and parse_ok and validation_ok:
+        render_ok = False
+        render_error = None
+        render_used = "none"
+        patch_data_rendered = None
+
+        if args.render_wav:
             # If the caption CSV already has a wav_path, preserve directory structure under wav_dir.
             if isinstance(wav_path, str) and wav_path.strip():
                 rendered_wav_rel = wav_path
@@ -503,14 +608,56 @@ def main() -> None:
             # Import here so running without --render_wav does not require scipy.
             from scipy.io.wavfile import write
 
-            audio = render_from_specs(
-                cleaned_specs,
-                sr=int(args.sr),
-                n=int(args.n),
-                v=int(args.v),
-                out_scale=float(args.out_scale),
-            )
-            write(str(full_wav_path), int(args.sr), audio)
+            def _try_render(specs_to_render: dict, *, label: str) -> bool:
+                nonlocal render_error, render_used, patch_data_rendered
+                audio = render_from_specs(
+                    specs_to_render,
+                    sr=int(args.sr),
+                    n=int(args.n),
+                    v=int(args.v),
+                    out_scale=float(args.out_scale),
+                )
+                write(str(full_wav_path), int(args.sr), audio)
+                render_used = label
+                patch_data_rendered = _json_compact(specs_to_render)
+                return True
+
+            try:
+                if parse_ok and validation_ok:
+                    # Try rendering the predicted patch as-is first.
+                    render_ok = _try_render(cleaned_specs, label="predicted")
+                elif parse_ok:
+                    # Invalid patch: try a repaired version for rendering (truncate/pad to expected shapes).
+                    repaired, notes = _repair_specs_for_render(cleaned_specs)
+                    render_ok = _try_render(repaired, label="repaired")
+                    if notes:
+                        render_error = f"repaired_for_render: {', '.join(notes)}"
+                else:
+                    render_ok = False
+            except Exception as exc:
+                render_ok = False
+                render_error = str(exc)
+
+                # Retry with repaired specs if we have a parsed patch.
+                if parse_ok:
+                    try:
+                        repaired, notes = _repair_specs_for_render(cleaned_specs)
+                        render_ok = _try_render(repaired, label="repaired_after_error")
+                        note_s = ", ".join(notes) if notes else "no_changes"
+                        render_error = f"{render_error} | repaired_after_error: {note_s}"
+                    except Exception as exc2:
+                        render_ok = False
+                        render_error = f"{render_error} | repaired_failed: {exc2}"
+
+                # Optional final fallback: default patch
+                if (not render_ok) and bool(args.render_fallback_default):
+                    try:
+                        default_specs = _default_render_specs()
+                        render_ok = _try_render(default_specs, label="default_fallback")
+                        render_error = (render_error + " | " if render_error else "") + "used default fallback"
+                    except Exception as exc3:
+                        render_ok = False
+                        render_error = f"{render_error} | default_fallback_failed: {exc3}"
 
         out_rows.append(
             {
@@ -529,10 +676,14 @@ def main() -> None:
                 "final_text": final_text,
                 "think_found": bool(think_found),
                 "patch_data": patch_data_json,
+                "patch_data_rendered": patch_data_rendered,
                 "parse_ok": bool(parse_ok),
                 "parse_error": parse_error,
                 "validation_ok": bool(validation_ok),
                 "validation_error": validation_error,
+                "render_ok": bool(render_ok),
+                "render_error": render_error,
+                "render_used": render_used,
                 "wav_path": rendered_wav_rel if args.render_wav else wav_path,
             }
         )

@@ -4,12 +4,19 @@ Fine-tune Qwen3-8B for DX7 patch generation (caption -> patch JSON),
 optionally mixing in intermediate reasoning stored in the CSV `cot` column.
 
 Key behavior
-- If `cot` is present and non-empty, we wrap it between Qwen-style thinking tokens:
+- Qwen3 hybrid-thinking control is encoded explicitly:
+  - user prompt ends with either `/think` (if `cot` is present) or `/no_think` (if missing/empty)
+  - assistant output ALWAYS starts with a `<think>...</think>` block
+    - reasoning examples: non-empty content inside `<think>...</think>`
+    - non-reasoning examples: empty `<think>\n\n</think>` block
+
+If `cot` is present and non-empty, we wrap it between Qwen-style thinking tokens:
     <think>
     ...
     </think>
-  and then append the final DX7 patch JSON (wrapped as a fenced ```json code block).
-- If `cot` is empty / missing, we output only the final DX7 patch JSON code block (non-reasoning).
+and then append the final DX7 patch JSON (wrapped as a fenced ```json code block).
+
+If `cot` is empty / missing, we still emit an EMPTY `<think>\n\n</think>` block and then the final patch JSON.
 
 Notes
 - This script mirrors the older training logic in `GCT634_final/fine_tuning.py`, but:
@@ -286,14 +293,15 @@ def _is_reasoning_cot(cot_text: Any) -> bool:
 
 def _build_assistant_target(*, cot_text: Any, patch_block: str) -> str:
     """
-    Always keep ALL reasoning data:
-    - If cot is non-empty: emit <think>cot</think> + final patch block.
-    - Else: emit only the final patch block (no explicit think content).
+    Qwen3 Hybrid Thinking training target (explicit, controllable):
+    - Always emit a <think>...</think> block.
+      - If `cot` is non-empty, place it inside the block.
+      - If `cot` is empty/missing, keep the block empty (<think>\\n\\n</think>).
+    - Always append the final DX7 patch JSON code block after </think>.
     """
-    if _is_reasoning_cot(cot_text):
-        cot = str(cot_text).strip()
-        return f"<think>\n{cot}\n</think>\n{patch_block}"
-    return patch_block
+    cot = str(cot_text).strip() if _is_reasoning_cot(cot_text) else ""
+    think_block = f"<think>\n{cot}\n</think>" if cot else "<think>\n\n</think>"
+    return f"{think_block}\n{patch_block}"
 
 
 def _downsample_non_reasoning_for_target_ratio(
@@ -382,16 +390,6 @@ def main() -> None:
         type=str,
         default='["name","has_fixed_freq"]',
         help="JSON list of patch keys to drop from patch_data before serializing to the final JSON.",
-    )
-    parser.add_argument(
-        "--append_think_tags",
-        action="store_true",
-        help=(
-            "Append a Qwen3-style soft switch tag to the *caption* inside the user prompt: "
-            "rows with non-empty `cot` get '/think', rows without get '/no_think'. "
-            "This provides an explicit controllable token you can mirror at inference time. "
-            "Note: this is independent of the tokenizer template's enable_thinking flag."
-        ),
     )
 
     # Reasoning mixing.
@@ -521,9 +519,10 @@ def main() -> None:
             if not _is_non_empty_str(caption):
                 raise ValueError(f"Row {sample_id}: missing caption")
 
-            caption_for_prompt = str(caption)
-            if args.append_think_tags:
-                caption_for_prompt = caption_for_prompt.rstrip() + (" /think" if _is_reasoning_cot(cot_text) else " /no_think")
+            # Qwen3 hybrid-thinking control token:
+            # - reasoning examples get "/think"
+            # - non-reasoning examples get "/no_think"
+            caption_for_prompt = str(caption).rstrip() + (" /think" if _is_reasoning_cot(cot_text) else " /no_think")
 
             user_text = prompt_template.format(prompt=caption_for_prompt)
             specs_raw = _parse_patch_data(patch_data, row_id=sample_id)
@@ -605,27 +604,41 @@ def main() -> None:
         shown = 0
         want = max(1, int(args.num_examples))
 
-        # First pass: prefer examples containing <think>
+        def _think_inner(text: str) -> str | None:
+            if not isinstance(text, str):
+                return None
+            a = text.find("<think>")
+            if a < 0:
+                return None
+            b = text.find("</think>", a)
+            if b < 0:
+                return None
+            inner = text[a + len("<think>") : b]
+            return inner.strip()
+
+        # First pass: prefer examples with NON-EMPTY think content (cot present).
         for conv in train_conv:
             if shown >= want:
                 break
             assistant = conv[1]["content"]
-            if "<think>" in assistant and "</think>" in assistant:
+            inner = _think_inner(assistant)
+            if inner is not None and inner != "":
                 _print_with_head_tail(
-                    "TRAIN EXAMPLE (with <think>)",
+                    "TRAIN EXAMPLE (cot -> non-empty <think>)",
                     user_text=conv[0]["content"],
                     assistant_text=assistant,
                 )
                 shown += 1
 
-        # Second pass: fill remaining with non-reasoning examples.
+        # Second pass: fill remaining with EMPTY think-block examples (cot missing/empty).
         for conv in train_conv:
             if shown >= want:
                 break
             assistant = conv[1]["content"]
-            if "<think>" not in assistant:
+            inner = _think_inner(assistant)
+            if inner == "":
                 _print_with_head_tail(
-                    "TRAIN EXAMPLE (no <think>)",
+                    "TRAIN EXAMPLE (no cot -> empty <think>)",
                     user_text=conv[0]["content"],
                     assistant_text=assistant,
                 )
@@ -663,10 +676,16 @@ def main() -> None:
         full_finetuning=True,
     )
 
-    # IMPORTANT: Explicitly disable any template-driven "auto thinking" injection.
-    # We control thinking strictly via the CSV `cot` column.
-    train_texts = tokenizer.apply_chat_template(train_conv, tokenize=False, enable_thinking=False)
-    test_texts = tokenizer.apply_chat_template(test_conv, tokenize=False, enable_thinking=False)
+    # IMPORTANT (Qwen3 tokenizer chat_template behavior):
+    # When enable_thinking=False, the template may inject an empty "<think>\\n\\n</think>\\n\\n" block
+    # right after the assistant indicator. Since our targets *already* include an explicit <think>...</think>
+    # block (empty or non-empty), we render training texts with enable_thinking=True to avoid duplication.
+    train_texts = tokenizer.apply_chat_template(train_conv, tokenize=False, add_generation_prompt=False, enable_thinking=True)
+    test_texts = tokenizer.apply_chat_template(test_conv, tokenize=False, add_generation_prompt=False, enable_thinking=True)
+
+    # Some tokenizers return a single string for a single conversation; normalize to list.
+    train_texts = list(train_texts) if not isinstance(train_texts, str) else [train_texts]
+    test_texts = list(test_texts) if not isinstance(test_texts, str) else [test_texts]
 
     train_text_ds = Dataset.from_pandas(pd.DataFrame({"text": pd.Series(train_texts, name="text")})).shuffle(seed=int(args.seed))
     test_text_ds = Dataset.from_pandas(pd.DataFrame({"text": pd.Series(test_texts, name="text")}))

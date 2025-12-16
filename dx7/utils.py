@@ -110,6 +110,8 @@ def validate_specs(specs, syx_file: str = "", patch_number: int = -1, *, verbose
 
     check_list_range("outmatrix", specs['outmatrix'], 0, 1)
     check_range("feedback", specs['feedback'], 0, 7)
+    check_list_shape("fixed_freq", specs["fixed_freq"], (6,))
+    check_list_range("fixed_freq", specs["fixed_freq"], 0, 1)
     check_list_range("coarse", specs['coarse'], 0, 31)
     check_list_range("fine", specs['fine'], 0, 99)
     check_list_range("detune", specs['detune'], -7, 7)
@@ -120,6 +122,7 @@ def validate_specs(specs, syx_file: str = "", patch_number: int = -1, *, verbose
     check_list_shape("sensitivity", specs['sensitivity'], (6,))
     check_list_shape("modmatrix", specs['modmatrix'], (6, 6))
     check_list_shape("outmatrix", specs['outmatrix'], (6,))
+    check_list_shape("fixed_freq", specs["fixed_freq"], (6,))
     check_list_shape("coarse", specs['coarse'], (6,))
     check_list_shape("fine", specs['fine'], (6,))
     check_list_shape("detune", specs['detune'], (6,))
