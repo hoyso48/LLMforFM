@@ -5,25 +5,29 @@ set -eo pipefail
 # - Render predicted wavs for every artifacts/*.csv (into outputs/pred_wav/<name>/...)
 # - Run KADTK metrics with vggish and passt-base-10s (KL/FAD/KAD)
 # - Run timbral evaluation (AudioCommons timbral_models + RMS)
-# - Run CLAP score evaluation (LAION-CLAP fusion-best) via evaluate.py
+# - Run CLAP score evaluation (LAION-CLAP music model) via evaluate.py
 #
 # This script is designed to be run non-interactively and without relying on `conda activate`.
 # It uses `conda run -n <ENV>` for every python invocation.
 #
 # Usage:
-#   bash LLMforFM/run_full_evaluation.sh
-#   # or from repo root:
-#   bash run_full_evaluation.sh
+#   # run all artifacts/*.csv:
+#   ./run_full_evaluation.sh
+#
+#   # run a single CSV:
+#   ./run_full_evaluation.sh /abs/path/to/some.csv
 #
 # Optional env vars:
 #   ENV_NAME=llmforfm_eval
 #   N_JOBS=16
 #   BATCH_SIZE=32
+#   CLAP_MODEL_NAME=music_audioset_epoch_15_esc_90.14.pt
 
 ENV_NAME="${ENV_NAME:-llmforfm_eval}"
 
 N_JOBS="${N_JOBS:-16}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
+CLAP_MODEL_NAME="${CLAP_MODEL_NAME:-music_audioset_epoch_15_esc_90.14.pt}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$SCRIPT_DIR"
@@ -92,10 +96,19 @@ if [[ ! -d "$ARTIFACTS_DIR" ]]; then
 fi
 
 shopt -s nullglob
-ARTIFACT_CSVS=("$ARTIFACTS_DIR"/*.csv)
-if [[ "${#ARTIFACT_CSVS[@]}" -eq 0 ]]; then
-  echo "[FATAL] No CSVs found in $ARTIFACTS_DIR" >&2
-  exit 1
+if [[ "${1:-}" != "" ]]; then
+  ONLY_CSV="$1"
+  if [[ ! -f "$ONLY_CSV" ]]; then
+    echo "[FATAL] CSV not found: $ONLY_CSV" >&2
+    exit 1
+  fi
+  ARTIFACT_CSVS=("$ONLY_CSV")
+else
+  ARTIFACT_CSVS=("$ARTIFACTS_DIR"/*.csv)
+  if [[ "${#ARTIFACT_CSVS[@]}" -eq 0 ]]; then
+    echo "[FATAL] No CSVs found in $ARTIFACTS_DIR" >&2
+    exit 1
+  fi
 fi
 
 if [[ ! -f "$BASELINE_CSV" ]]; then
@@ -121,14 +134,23 @@ for CSV in "${ARTIFACT_CSVS[@]}"; do
 
   echo
   echo "==================== $NAME ===================="
-  echo "[INFO] CSV: $CSV"
+  echo "[INFO] Input CSV: $CSV"
   echo "[INFO] Pred wav dir: $PRED_WAV_DIR"
   echo "[INFO] Out dir: $OUT_DIR"
+
+  # 0) Normalize CSV into expected evaluation schema (id, wav_path, patch_data)
+  NORMALIZED_CSV="$OUT_DIR/${NAME}_normalized_eval.csv"
+  python "$PROJECT_ROOT/scripts/normalize_eval_csv.py" \
+    --input_csv "$CSV" \
+    --output_csv "$NORMALIZED_CSV" \
+    --drop_failed_render \
+    --prefer_rendered_patch \
+    2>&1 | tee "$LOG_DIR/${NAME}_normalize.log"
 
   # 1) Render predicted wavs (use the repo's canonical renderer)
   echo "[STEP] Rendering predicted wavs (dx7/patch_to_wav.py) ..."
   python "$PROJECT_ROOT/dx7/patch_to_wav.py" \
-    --input_path "$CSV" \
+    --input_path "$NORMALIZED_CSV" \
     --wav_dir "$PRED_WAV_DIR" \
     --sr 48000 --n 60 --velocity 100 --out_scale 1.0 \
     --jobs -1
@@ -136,7 +158,7 @@ for CSV in "${ARTIFACT_CSVS[@]}"; do
   # 2) KADTK vggish
   echo "[STEP] KADTK (vggish): KL/FAD/KAD ..."
   python -m kadtk.evaluate \
-    --eval_csv_path "$CSV" \
+    --eval_csv_path "$NORMALIZED_CSV" \
     --eval_wav_dir "$PRED_WAV_DIR" \
     --output_csv_path "$OUT_DIR/${NAME}_kadtk_vggish.csv" \
     --baseline_csv_path "$BASELINE_CSV" \
@@ -149,7 +171,7 @@ for CSV in "${ARTIFACT_CSVS[@]}"; do
   # 3) KADTK passt
   echo "[STEP] KADTK (passt-base-10s): KL/FAD/KAD ..."
   python -m kadtk.evaluate \
-    --eval_csv_path "$CSV" \
+    --eval_csv_path "$NORMALIZED_CSV" \
     --eval_wav_dir "$PRED_WAV_DIR" \
     --output_csv_path "$OUT_DIR/${NAME}_kadtk_passt.csv" \
     --baseline_csv_path "$BASELINE_CSV" \
@@ -163,7 +185,7 @@ for CSV in "${ARTIFACT_CSVS[@]}"; do
   echo "[STEP] Timbral evaluation (timbral_models + RMS) ..."
   EVAL_CSV_TIMBRAL="$OUT_DIR/${NAME}_eval_for_timbral.csv"
   BASELINE_CSV_TIMBRAL="$OUT_DIR/baseline_for_timbral.csv"
-  cp -f "$CSV" "$EVAL_CSV_TIMBRAL"
+  cp -f "$NORMALIZED_CSV" "$EVAL_CSV_TIMBRAL"
   cp -f "$BASELINE_CSV" "$BASELINE_CSV_TIMBRAL"
   python "$PROJECT_ROOT/evaluate_timbral.py" \
     --eval_csv_path "$EVAL_CSV_TIMBRAL" \
@@ -174,17 +196,18 @@ for CSV in "${ARTIFACT_CSVS[@]}"; do
     --n_jobs "$N_JOBS" \
     2>&1 | tee "$LOG_DIR/${NAME}_timbral.log"
 
-  # 5) CLAP score evaluation (fusion-best) via evaluate.py
-  echo "[STEP] CLAP evaluation (fusion-best) ..."
+  # 5) CLAP score evaluation (music model) via evaluate.py
+  echo "[STEP] CLAP evaluation (music) ..."
   python "$PROJECT_ROOT/evaluate.py" \
-    --data_csv_path "$CSV" \
+    --data_csv_path "$NORMALIZED_CSV" \
     --caption_csv_path "$CAPTION_CSV" \
-    --output_csv_path "$OUT_DIR/${NAME}_clap.csv" \
+    --output_csv_path "$OUT_DIR/${NAME}_clap_music.csv" \
     --wav_dir "$PRED_WAV_DIR" \
     --batch_size "$BATCH_SIZE" \
     --metrics clap \
     --device "$DEVICE" \
-    2>&1 | tee "$LOG_DIR/${NAME}_clap.log"
+    --clap_model_name "$CLAP_MODEL_NAME" \
+    2>&1 | tee "$LOG_DIR/${NAME}_clap_music.log"
 
   echo "[OK] Done: $NAME"
 done

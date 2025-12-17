@@ -278,8 +278,8 @@ def main() -> None:
     parser.add_argument("--skip_passt", action="store_true", help="Skip PaSST embedding extraction.")
     parser.add_argument(
         "--clap_model_name",
-        default="630k-audioset-fusion-best.pt",
-        help="LAION-CLAP checkpoint name (default: fusion-best).",
+        default="music_audioset_epoch_15_esc_90.14.pt",
+        help="LAION-CLAP checkpoint name (default: music).",
     )
     parser.add_argument("--passt_model", default="passt-base-10s", help="PaSST model name to use.")
     parser.add_argument("--clap_batch_size", type=int, default=32)

@@ -2,7 +2,7 @@
 Audio evaluation utilities for DX7 dataset generations.
 
 This script computes:
-- CLAP score (LAION-CLAP, default: fusion-best)
+- CLAP score (LAION-CLAP, default: music)
 - Optional: audiobox aesthetics (if installed and requested)
 
 Input CSV requirements:
@@ -132,7 +132,7 @@ def main() -> None:
     parser.add_argument(
         "--clap_model_name",
         type=str,
-        default="630k-audioset-fusion-best.pt",
+        default="music_audioset_epoch_15_esc_90.14.pt",
         help="LAION-CLAP checkpoint name (see clap_score.py).",
     )
 

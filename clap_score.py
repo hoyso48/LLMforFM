@@ -6,7 +6,7 @@ This file is intentionally based on the existing `clap_score.py` workflow used i
 - Text embeddings and audio embeddings are extracted with LAION-CLAP.
 - CLAP score is cosine similarity between paired (audio, text) embeddings.
 
-Default model: **630k-audioset-fusion-best.pt** (fusion-best).
+Default model: **music_audioset_epoch_15_esc_90.14.pt** (music).
 """
 
 from __future__ import annotations
@@ -59,14 +59,14 @@ def _download_if_needed(url: str, dest: Path) -> None:
 
 
 def load_clap_model(
-    clap_model_name: CLAP_MODEL_NAME = "630k-audioset-fusion-best.pt",
+    clap_model_name: CLAP_MODEL_NAME = "music_audioset_epoch_15_esc_90.14.pt",
     *,
     device: str = "cuda",
     cache_dir: str | Path = "load/clap_score",
 ) -> laion_clap.CLAP_Module:
     """
     Load a LAION-CLAP model checkpoint (with caching).
-    Default is fusion-best: 630k-audioset-fusion-best.pt
+    Default is music: music_audioset_epoch_15_esc_90.14.pt
     """
     cache_dir = Path(cache_dir)
 

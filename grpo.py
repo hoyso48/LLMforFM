@@ -2,7 +2,7 @@
 """
 GRPO training for DX7 tool learning (caption -> DX7 patch JSON).
 
-This script implements two reward modes:
+This script implements reward modes:
 
 1) toolrl_exact:
    - ToolRL-style reward decomposition with NO annealing:
@@ -10,12 +10,24 @@ This script implements two reward modes:
    - R_format ∈ {0, 1}: 1 iff the completion contains a parsable DX7 patch JSON and passes schema/range checks.
    - R_correct ∈ [-3, 3]: ToolRL correctness reward with (tool-name, key-name, value) matching.
 
-2) dx7_dist (our extension):
+2) toolrl_topology_gate:
+   - ToolRL-style reward decomposition, but correctness is *conditional* on topology:
+     - Values for non-topology parameters only receive correctness credit if BOTH
+       `modmatrix` and `outmatrix` exactly match the ground truth.
+     - R_final = R_format + R_correct (no annealing).
+
+3) dx7_dist (our extension):
    - Dense, weighted parameter-distance reward with NO annealing:
      R = alpha * R_valid + beta * R_keys + gamma * R_dist
    - R_valid ∈ {0, 1}: 1 iff completion is a valid DX7 patch (schema + ranges), else 0.
    - R_keys ∈ [0, 1]: fraction of required DX7 keys present (partial credit).
    - R_dist ∈ [0, 1]: weighted, continuous similarity over parameters (off-by-one gets partial credit).
+
+4) dx7_dist_topology_gate:
+   - Dense distance reward gated by topology:
+     - `modmatrix` and `outmatrix` distance is always scored.
+     - All other keys' distance terms are scored ONLY if (`modmatrix`, `outmatrix`) exactly match GT.
+     - Otherwise, those non-topology distance terms contribute 0.
 
 Notes
 -----
@@ -311,6 +323,61 @@ def _has_all_required_keys(specs: dict[str, Any]) -> bool:
     return all(k in specs for k in KEY_ORDER)
 
 
+def _flatten_patch_params(specs: dict[str, Any], *, include_top_keys: set[str] | None = None) -> dict[str, Any]:
+    """
+    Flatten the DX7 patch into a dict of scalar parameters.
+
+    If `include_top_keys` is provided, only includes those top-level keys.
+
+    Examples:
+    - coarse[0], coarse[1], ...
+    - eg_rate[0][0], ..., eg_rate[3][5]
+    """
+    out: dict[str, Any] = {}
+    for key in KEY_ORDER:
+        if include_top_keys is not None and key not in include_top_keys:
+            continue
+        if key not in specs:
+            continue
+        v = specs[key]
+        shape = DX7_SCHEMA[key]["shape"]
+        if shape is None:
+            out[key] = v
+            continue
+        if len(shape) == 1:
+            if not isinstance(v, list):
+                continue
+            for i, elem in enumerate(v):
+                out[f"{key}[{i}]"] = elem
+            continue
+        if len(shape) == 2:
+            if not isinstance(v, list):
+                continue
+            for i, row in enumerate(v):
+                if not isinstance(row, list):
+                    continue
+                for j, elem in enumerate(row):
+                    out[f"{key}[{i}][{j}]"] = elem
+            continue
+    return out
+
+
+def _topology_exact_match(pred: dict[str, Any], gt: dict[str, Any]) -> bool:
+    """
+    Return True iff modmatrix + outmatrix match exactly (element-wise),
+    allowing int-like numeric equivalence (e.g., 1 == 1.0 == "1").
+    """
+    topo_keys = {"modmatrix", "outmatrix"}
+    gt_top = _flatten_patch_params(gt, include_top_keys=topo_keys)
+    pred_top = _flatten_patch_params(pred, include_top_keys=topo_keys)
+    if set(gt_top.keys()) != set(pred_top.keys()):
+        return False
+    for k, t in gt_top.items():
+        if _elem_match(pred_top.get(k), t) < 0.5:
+            return False
+    return True
+
+
 def _is_int_like(x: Any, *, tol: float = 1e-6) -> bool:
     v = _to_float(x)
     if v is None:
@@ -545,6 +612,51 @@ def _dx7_distance_reward(pred: dict[str, Any], true: dict[str, Any], *, key_weig
     return (acc / total_w) if total_w > 0.0 else 0.0
 
 
+def _dx7_distance_reward_topology_gate(pred: dict[str, Any], true: dict[str, Any], *, key_weights: dict[str, float]) -> float:
+    """
+    Distance reward with a hard topology gate:
+    - Always score `modmatrix` and `outmatrix`.
+    - Score all other keys ONLY if topology matches exactly.
+    """
+    categorical_keys = {"modmatrix", "outmatrix", "fixed_freq"}
+    topo_ok = _topology_exact_match(pred, true)
+
+    total_w = 0.0
+    acc = 0.0
+    for k in KEY_ORDER:
+        w = float(key_weights.get(k, 1.0))
+        spec = DX7_SCHEMA[k]
+
+        score_k = 0.0
+        if k in pred:
+            if k in {"modmatrix", "outmatrix"}:
+                mode = "categorical"
+                score_k = _score_with_shape(
+                    pred[k],
+                    true[k],
+                    shape=spec["shape"],
+                    lo=float(spec["lo"]),
+                    hi=float(spec["hi"]),
+                    mode=mode,
+                )
+            elif topo_ok:
+                mode = "categorical" if k in categorical_keys else "continuous"
+                score_k = _score_with_shape(
+                    pred[k],
+                    true[k],
+                    shape=spec["shape"],
+                    lo=float(spec["lo"]),
+                    hi=float(spec["hi"]),
+                    mode=mode,
+                )
+            else:
+                score_k = 0.0
+
+        acc += w * score_k
+        total_w += w
+    return (acc / total_w) if total_w > 0.0 else 0.0
+
+
 # -----------------------
 # Reward functions (ToolRL)
 # -----------------------
@@ -586,40 +698,6 @@ def reward_toolrl_correctness(
     tool_name = "dx7_patch"
     ng = {tool_name}
 
-    def _flatten_params(specs: dict[str, Any]) -> dict[str, Any]:
-        """
-        Flatten the DX7 patch into a dict of scalar parameters.
-
-        Examples:
-        - coarse[0], coarse[1], ...
-        - eg_rate[0][0], ..., eg_rate[3][5]
-        """
-        out: dict[str, Any] = {}
-        for key in KEY_ORDER:
-            if key not in specs:
-                continue
-            v = specs[key]
-            shape = DX7_SCHEMA[key]["shape"]
-            if shape is None:
-                out[key] = v
-                continue
-            if len(shape) == 1:
-                if not isinstance(v, list):
-                    continue
-                for i, elem in enumerate(v):
-                    out[f"{key}[{i}]"] = elem
-                continue
-            if len(shape) == 2:
-                if not isinstance(v, list):
-                    continue
-                for i, row in enumerate(v):
-                    if not isinstance(row, list):
-                        continue
-                    for j, elem in enumerate(row):
-                        out[f"{key}[{i}][{j}]"] = elem
-                continue
-        return out
-
     for comp, gt_item in zip(completions, answer):
         gt = _answer_to_patch(gt_item, keys_to_remove=keys_to_remove)
         if gt is None:
@@ -631,8 +709,8 @@ def reward_toolrl_correctness(
 
         rname = _jaccard(ng, npred)
 
-        gt_flat = _flatten_params(gt)
-        pred_flat = _flatten_params(pred) if pred is not None else {}
+        gt_flat = _flatten_patch_params(gt)
+        pred_flat = _flatten_patch_params(pred) if pred is not None else {}
         keys_true = set(gt_flat.keys())
         keys_pred = set(pred_flat.keys())
         rparam = _jaccard(keys_true, keys_pred)
@@ -646,6 +724,61 @@ def reward_toolrl_correctness(
         smax = 1.0 + 1.0 + float(len(keys_true))
         rcorrect = 6.0 * (rmax / smax) - 3.0
         scores.append(float(rcorrect))
+    return scores
+
+
+def reward_toolrl_correctness_topology_gate(
+    prompts: list[Any],
+    completions: list[Any],
+    answer: list[Any],
+    *,
+    keys_to_remove: list[str],
+    **_: Any,
+) -> list[float]:
+    """
+    ToolRL correctness reward with a conditional gate:
+    - `modmatrix` + `outmatrix` matches are always counted normally.
+    - Non-topology parameter value matches are counted ONLY if topology matches exactly.
+    """
+    scores: list[float] = []
+    tool_name = "dx7_patch"
+    ng = {tool_name}
+
+    for comp, gt_item in zip(completions, answer):
+        gt = _answer_to_patch(gt_item, keys_to_remove=keys_to_remove)
+        if gt is None:
+            scores.append(-3.0)
+            continue
+
+        pred = _try_parse_pred_patch(_completion_to_text(comp), keys_to_remove=keys_to_remove)
+        npred = {tool_name} if pred is not None else set()
+        rname = _jaccard(ng, npred)
+
+        gt_flat = _flatten_patch_params(gt)
+        pred_flat = _flatten_patch_params(pred) if pred is not None else {}
+        keys_true = set(gt_flat.keys())
+        keys_pred = set(pred_flat.keys())
+        rparam = _jaccard(keys_true, keys_pred)
+
+        topo_ok = bool(pred is not None and _topology_exact_match(pred, gt))
+
+        rvalue = 0.0
+        for k in keys_true:
+            if k not in pred_flat:
+                continue
+            top_key = k.split("[", 1)[0]
+            if top_key in {"modmatrix", "outmatrix"}:
+                if _elem_match(pred_flat[k], gt_flat[k]) > 0.5:
+                    rvalue += 1.0
+            else:
+                if topo_ok and _elem_match(pred_flat[k], gt_flat[k]) > 0.5:
+                    rvalue += 1.0
+
+        rmax = rname + rparam + rvalue
+        smax = 1.0 + 1.0 + float(len(keys_true))
+        rcorrect = 6.0 * (rmax / smax) - 3.0
+        scores.append(float(rcorrect))
+
     return scores
 
 
@@ -716,6 +849,31 @@ def reward_dx7_distance(
             scores.append(0.0)
             continue
         dist = _dx7_distance_reward(pred, gt, key_weights=key_weights)
+        scores.append(float(gamma) * float(dist))
+    return scores
+
+
+def reward_dx7_distance_topology_gate(
+    prompts: list[Any],
+    completions: list[Any],
+    answer: list[Any],
+    *,
+    keys_to_remove: list[str],
+    gamma: float,
+    key_weights: dict[str, float],
+    **_: Any,
+) -> list[float]:
+    scores: list[float] = []
+    for comp, gt_item in zip(completions, answer):
+        gt = _answer_to_patch(gt_item, keys_to_remove=keys_to_remove)
+        if gt is None:
+            scores.append(0.0)
+            continue
+        pred = _try_parse_pred_patch(_completion_to_text(comp), keys_to_remove=keys_to_remove)
+        if pred is None:
+            scores.append(0.0)
+            continue
+        dist = _dx7_distance_reward_topology_gate(pred, gt, key_weights=key_weights)
         scores.append(float(gamma) * float(dist))
     return scores
 
@@ -895,7 +1053,12 @@ def main() -> None:
 
     # GRPO
     parser.add_argument("--output_dir", type=str, default="outputs/grpo_dx7")
-    parser.add_argument("--reward_mode", type=str, default="dx7_dist", choices=["toolrl_exact", "dx7_dist"])
+    parser.add_argument(
+        "--reward_mode",
+        type=str,
+        default="dx7_dist",
+        choices=["toolrl_exact", "toolrl_topology_gate", "dx7_dist", "dx7_dist_topology_gate"],
+    )
     parser.add_argument("--learning_rate", type=float, default=5e-6)
     parser.add_argument("--weight_decay", type=float, default=0.001)
     parser.add_argument("--warmup_ratio", type=float, default=0.1)
@@ -1071,6 +1234,20 @@ def main() -> None:
             lambda **kw: reward_toolrl_correctness(keys_to_remove=keys_to_remove, **kw),
         ]
         reward_names = ["toolrl_format", "toolrl_correctness"]
+    elif args.reward_mode == "toolrl_topology_gate":
+        reward_funcs = [
+            lambda **kw: reward_toolrl_format(keys_to_remove=keys_to_remove, **kw),
+            lambda **kw: reward_toolrl_correctness_topology_gate(keys_to_remove=keys_to_remove, **kw),
+        ]
+        reward_names = ["toolrl_format", "toolrl_correctness_topology_gate"]
+    elif args.reward_mode == "dx7_dist_topology_gate":
+        key_weights = _parse_key_weights_json(str(args.key_weights_json))
+        reward_funcs = [
+            lambda **kw: reward_dx7_valid(keys_to_remove=keys_to_remove, alpha=float(args.alpha), invalid_reward=float(args.invalid_reward), **kw),
+            lambda **kw: reward_dx7_key_coverage(keys_to_remove=keys_to_remove, beta=float(args.beta_keys), **kw),
+            lambda **kw: reward_dx7_distance_topology_gate(keys_to_remove=keys_to_remove, gamma=float(args.gamma), key_weights=key_weights, **kw),
+        ]
+        reward_names = ["dx7_valid", "dx7_keys", "dx7_dist_topology_gate"]
     else:
         key_weights = _parse_key_weights_json(str(args.key_weights_json))
         reward_funcs = [

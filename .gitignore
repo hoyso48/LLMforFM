@@ -12,6 +12,7 @@ unsloth_training_checkpoints/
 results/
 outputs/
 references/
+AI707_report/
 models/
 wandb/
 artifacts/

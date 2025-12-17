@@ -458,6 +458,36 @@ We keep a **ToolRL-faithful baseline** (for apples-to-apples comparison), then i
   \(R=\alpha\,R_\text{format}+\beta\,R_\text{keys}+\gamma\,R_\text{dist}\).  
   Format stability is enforced by keeping \(R_\text{format}\) as a hard validity gate (invalid JSON / schema violations receive 0 format reward and are heavily disfavored by the total reward).
 
+#### Additional reward variants implemented in `grpo.py` (topology-gated)
+
+Based on the DX7 structure, there is an important asymmetry: if the **operator topology** is wrong, many other parameters (frequency ratios, envelopes, levels) can become semantically “misaligned” with the intended sound. This motivates a simple conditional design: **only reward non-topology parameters once topology is correct**.
+
+We implemented two topology-gated variants (no annealing) to test this hypothesis cheaply:
+
+- **ToolRL exact baseline (`reward_mode=toolrl_exact`)**
+  - **Definition**: \(R_\text{final}=R_\text{format}+R_\text{correct}\)
+  - **Correctness**: ToolRL-style matching over *flattened* DX7 scalar parameters (128 dims), scaled to \([-3,3]\).
+  - **Pros**: closest to ToolRL; strongest apples-to-apples baseline.
+  - **Risk**: extremely sparse once the model is “close but not exact” (off-by-one cliffs).
+
+- **ToolRL topology-gated (`reward_mode=toolrl_topology_gate`)**
+  - **Definition**: \(R_\text{final}=R_\text{format}+R_\text{correct}\)
+  - **Gate**: `modmatrix` + `outmatrix` exact match is required before *any* other key’s value-matching contributes to \(R_\text{correct}\).
+  - **Pros**: prioritizes learning the correct operator graph first; prevents “rewarding meaningless parameter matches under the wrong topology.”
+  - **Risk**: if topology exact-match is too rare early in training, this can become too harsh (learning signal collapses to mostly topology + format).
+
+- **Dense distance (`reward_mode=dx7_dist`)**
+  - **Definition**: \(R=\alpha\,R_\text{valid}+\beta\,R_\text{keys}+\gamma\,R_\text{dist}\)
+  - **Distance**: continuous similarity for numeric keys + categorical match for binary topology keys; weighted sum over top-level keys.
+  - **Pros**: best “single bet” for 1-shot runs; smooth credit assignment; avoids exact-match cliffs.
+  - **Risk**: can still give partial credit to “good parameters under wrong topology,” which may or may not correlate with downstream audio quality.
+
+- **Dense distance with topology gate (`reward_mode=dx7_dist_topology_gate`)**
+  - **Definition**: same as `dx7_dist`.
+  - **Gate**: distance for `modmatrix` + `outmatrix` is always counted, but **all other keys’ distance terms are counted only if topology matches exactly**.
+  - **Pros**: combines dense shaping *after* topology is correct; encourages a two-stage solution without explicit annealing.
+  - **Risk**: same as above—if topology exact match is rare, most of the dense signal disappears and learning may slow.
+
 #### Per-key weighting (one simple bet)
 
 We prioritize keys that most strongly change timbre/structure, using a small number of weight groups:
