@@ -82,6 +82,7 @@ if __name__ == "__main__":
     parser.add_argument("--sr", type=int, default=48000)
     parser.add_argument("--n", type=int, default=60)
     parser.add_argument("--v", type=int, default=100)
+    parser.add_argument("--velocity", dest="v", type=int, help="Alias for --v (MIDI velocity).")
     parser.add_argument("--out_scale", type=float, default=1.0)
     parser.add_argument("--limit", type=int, help="Optional limit on number of rows to render.")
     parser.add_argument("--jobs", type=int, default=-1, help="Number of parallel workers (joblib).")

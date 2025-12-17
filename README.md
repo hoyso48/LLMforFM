@@ -98,3 +98,7 @@ python grpo.py \
   --wandb_api_key YOUR_WANDB_KEY
 ```
 
+Notes:
+- By default we keep only the **last 2** checkpoints (`--save_total_limit 2`).
+- To resume a crashed run: add `--resume_from_checkpoint latest`.
+

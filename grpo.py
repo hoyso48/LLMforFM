@@ -56,6 +56,7 @@ import torch
 from datasets import Dataset
 from peft import LoraConfig, TaskType
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.trainer_utils import get_last_checkpoint
 from trl import GRPOConfig, GRPOTrainer
 
 # Allow running from anywhere (not only repo root).
@@ -900,6 +901,7 @@ def main() -> None:
     parser.add_argument("--warmup_ratio", type=float, default=0.1)
     parser.add_argument("--max_steps", type=int, default=2000)
     parser.add_argument("--save_steps", type=int, default=200)
+    parser.add_argument("--save_total_limit", type=int, default=2, help="Max number of checkpoints to keep in output_dir.")
     parser.add_argument("--logging_steps", type=int, default=1)
     parser.add_argument("--max_seq_length", type=int, default=2048, help="Total context window budget (prompt + completion).")
     parser.add_argument("--max_prompt_length", type=int, default=None, help="Max prompt tokens. Default: inferred from prompt_length_quantile.")
@@ -944,6 +946,12 @@ def main() -> None:
         default=None,
         choices=["online", "offline", "disabled"],
         help="Optional. If set, exports WANDB_MODE (use 'offline' to avoid login).",
+    )
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help="Optional. Path to a checkpoint dir, or 'latest' to auto-resume from the newest checkpoint in output_dir.",
     )
 
     args = parser.parse_args()
@@ -1092,6 +1100,7 @@ def main() -> None:
         "optim": "adamw_8bit",
         "logging_steps": int(args.logging_steps),
         "save_steps": int(args.save_steps),
+        "save_total_limit": int(args.save_total_limit) if args.save_total_limit is not None else None,
         "max_steps": int(args.max_steps),
         "per_device_train_batch_size": int(args.per_device_train_batch_size),
         "gradient_accumulation_steps": int(args.gradient_accumulation_steps),
@@ -1162,7 +1171,21 @@ def main() -> None:
         peft_config=peft_config,
     )
 
-    trainer.train()
+    # Optional resume
+    resume_arg = args.resume_from_checkpoint
+    resume_path: str | None = None
+    if _is_non_empty_str(resume_arg):
+        s = str(resume_arg).strip()
+        if s.lower() == "latest":
+            last = get_last_checkpoint(str(out_dir))
+            if last is None:
+                raise ValueError(f"--resume_from_checkpoint latest was set, but no checkpoint was found in: {out_dir}")
+            resume_path = str(last)
+        else:
+            resume_path = s
+        print(f"[INFO] Resuming training from checkpoint: {resume_path}", file=sys.stderr)
+
+    trainer.train(resume_from_checkpoint=resume_path)
 
     # Save final model for inference.
     # - LoRA: save adapter weights under final_lora/
